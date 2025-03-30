@@ -1,102 +1,101 @@
 import os
+import pickle
+import datetime
+import json
 import cv2
 import numpy as np
-import streamlit as st
-import firebase_admin
-from firebase_admin import credentials, firestore
 import face_recognition
-import pickle
-from PIL import Image
+from flask import Flask, request, jsonify
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
 
 # Initialize Firebase
 cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred)
+firebase_admin.initialize_app(cred, {'storageBucket': 'your-project-id.appspot.com'})
 db = firestore.client()
+bucket = storage.bucket()
 
-st.title("Facial Recognition Attendance System")
-
-# Initialize webcam
-cap = cv2.VideoCapture(0)
+app = Flask(__name__)
 
 
-def capture_frame():
-    """Capture an image from the webcam"""
-    ret, frame = cap.read()
-    if ret:
-        return frame
-    return None
-
-
-def recognize_user(frame):
-    """Recognize user by comparing against stored embeddings"""
-    embeddings_unknown = face_recognition.face_encodings(frame)
+def recognize_face(unknown_image):
+    embeddings_unknown = face_recognition.face_encodings(unknown_image)
     if len(embeddings_unknown) == 0:
         return 'no_persons_found'
-    else:
-        embeddings_unknown = embeddings_unknown[0]
 
+    embeddings_unknown = embeddings_unknown[0]
+
+    # Fetch all registered users
     users_ref = db.collection("users").stream()
 
     for user in users_ref:
         data = user.to_dict()
-        stored_embedding = pickle.loads(data["embedding"])
+        known_embedding = np.array(json.loads(data["embedding"]))
 
-        match = face_recognition.compare_faces([stored_embedding], embeddings_unknown)[0]
+        match = face_recognition.compare_faces([known_embedding], embeddings_unknown)[0]
         if match:
             return data["name"]
 
     return 'unknown_person'
 
 
-# Authentication Section
-st.header("User Authentication")
+@app.route('/register', methods=['POST'])
+def register():
+    file = request.files['image']
+    name = request.form['name']
 
-if st.button("Login"):
-    frame = capture_frame()
-    if frame is not None:
-        user = recognize_user(frame)
-        if user in ['unknown_person', 'no_persons_found']:
-            st.error("Unknown user. Please register.")
-        else:
-            st.success(f"Welcome back, {user}!")
-            db.collection("attendance").add({
-                "name": user,
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "status": "in"
-            })
+    image = face_recognition.load_image_file(file)
+    embeddings = face_recognition.face_encodings(image)
 
-if st.button("Logout"):
-    frame = capture_frame()
-    if frame is not None:
-        user = recognize_user(frame)
-        if user in ['unknown_person', 'no_persons_found']:
-            st.error("Unknown user. Please register.")
-        else:
-            st.success(f"Goodbye, {user}!")
-            db.collection("attendance").add({
-                "name": user,
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "status": "out"
-            })
+    if len(embeddings) == 0:
+        return jsonify({"error": "No face found"}), 400
 
-# New User Registration
-st.header("Register New User")
-username = st.text_input("Enter your name:")
-if st.button("Capture & Register"):
-    frame = capture_frame()
-    if frame is not None:
-        embeddings = face_recognition.face_encodings(frame)
-        if embeddings:
-            user_data = {
-                "name": username,
-                "embedding": pickle.dumps(embeddings[0])  # Convert to bytes before storing
-            }
-            db.collection("users").add(user_data)
-            st.success(f"User {username} registered successfully!")
-        else:
-            st.error("No face detected. Try again.")
+    # Save face embedding
+    db.collection("users").document(name).set({
+        "name": name,
+        "embedding": json.dumps(embeddings[0].tolist())
+    })
 
-# Close webcam when app stops
-if st.button("Close Webcam"):
-    cap.release()
-    st.write("Webcam closed.")
+    return jsonify({"message": "User registered successfully!"})
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    file = request.files['image']
+    image = face_recognition.load_image_file(file)
+
+    name = recognize_face(image)
+
+    if name in ['unknown_person', 'no_persons_found']:
+        return jsonify({"error": "Face not recognized"}), 401
+
+    db.collection("attendance").add({
+        "name": name,
+        "time": datetime.datetime.now().isoformat(),
+        "status": "in"
+    })
+
+    return jsonify({"message": f"Welcome, {name}!"})
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    file = request.files['image']
+    image = face_recognition.load_image_file(file)
+
+    name = recognize_face(image)
+
+    if name in ['unknown_person', 'no_persons_found']:
+        return jsonify({"error": "Face not recognized"}), 401
+
+    db.collection("attendance").add({
+        "name": name,
+        "time": datetime.datetime.now().isoformat(),
+        "status": "out"
+    })
+
+    return jsonify({"message": f"Goodbye, {name}!"})
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
